@@ -128,12 +128,39 @@
 | **OFF_LOG** | ❌ | `1`或`true` | 默认**开启**KV日志记录功能，设置`1`或`true`则**关闭**日志记录功能 |
 | **BEST_SUB** | ❌ | `1`或`true` | 默认**关闭**作为**优选订阅生成器**的功能，设置`1`或`true`则**开启**该功能 |
 | **PRELOAD_RACE_DIAL** | ❌ | `1`或`true` | 默认**关闭**作为**预加载竞速拨号**的功能，设置`1`或`true`则**开启**该功能 |
+| **DOH_IPV4_ONLY** | ❌ | `true` | 默认**开启**目标 TCP 直连的 DoH IPv4 模式；`false` 或 `0` 恢复原有拨号策略。优先于 `PRELOAD_RACE_DIAL`，不控制上游代理的最终出口 |
 | **TCP_CONCURRENT_DIAL**   | ❌ | `2` | **TCP 并发拨号数**，默认值为`2`；设置后不再根据中国移动网络自动降为单路 |
 | **PROXY_CONCURRENT_DIAL** | ❌ | `1` | **反代并发拨号数**，默认值为`1`；数值越高连接速度越快，但 IP 切换也越频繁 |
 
 ---
 
 ## 🔧 高级实用技巧
+
+### DoH IPv4 直连与部署验证
+
+当前 `_worker.js` 默认对所有目标 TCP 直连启用 IPv4 模式，无需额外开启 `PRELOAD_RACE_DIAL`，Pages 域名可继续托管在 Cloudflare：
+
+- 域名通过 `https://cloudflare-dns.com/dns-query` 查询 A 记录，按 `TCP_CONCURRENT_DIAL` 分批尝试全部有效 IPv4；IPv4 字面量直接连接。原始 TLS 数据保持透传。
+- DoH 请求及响应体读取最多等待 3 秒，成功结果按 A/CNAME 的最短 TTL 缓存，最长 300 秒。解析失败、无 A 记录或 IPv6 字面量会终止该次目标直连，不回退域名解析或代理。客户端应传入目标域名或 IPv4；仅支持 IPv6 的目标无法直连。
+- TCP 连接失败或无下行数据时仍保留原有代理回退；显式 SOCKS5/HTTP 等代理分流也保留。代理路径不受该开关约束，不能保证其最终出口为 IPv4。DNS UDP 转发及 Trojan UDP fallback 不受此开关控制。
+
+部署后可临时设置 `DEBUG=true`，访问 Google 时查看 `[DoH IPv4] 直连成功: 域名 -> IPv4:端口`。如果出现 `进入代理路径`，应将这次测试视为代理出口测试，而非 CF IPv4 直连测试。调试日志含目标域名/IP，验证后可移除 `DEBUG` 并重新部署。
+
+对照测试时设置 `DOH_IPV4_ONLY=false` 并重新部署，恢复修改前的拨号策略（仍由原有 `PRELOAD_RACE_DIAL` 控制）。无需更换域名托管。此方案用于缓解地址族相关的定位问题，不保证 Google 地区或验证码表现；应以实际服务及其 IP 定位结果为准。
+
+本地回归验证：`node --test tests/doh_ipv4.test.mjs`。
+
+### Google 搜索识别的代理地区
+
+新增独立的 [Python 检测脚本](./collector/README.md)，通过指定 HTTP/SOCKS5 代理请求 Google 搜索页，提取地区及“根据 IP 地址推断”的来源说明：
+
+```bash
+python3 -m pip install -r collector/requirements.txt
+python3 collector/main.py --proxy http://127.0.0.1:7890
+```
+
+该入口返回 HTML，并非已确认的独立 IP 查询 API；遇到验证码、JavaScript 挑战或定位来源不符时会输出明确失败状态。测试本项目节点时，请传客户端的本地代理端口，不能直接传 `PROXYIP`。
+
 如需修改 **订阅地址里的TOKEN** 和 **用于节点验证的UUID** ，可通过修改变量
 1. 修改`ADMIN`或`KEY`变量的值，可以随机修改 **订阅地址里的TOKEN** 和 **用于节点验证的UUID**
 2. 设置`UUID`变量可以强制固定 **订阅地址里的TOKEN** 和 **用于节点验证的UUID**，注意必须是**UUIDv4**标准格式，否则会导致节点无法使用。

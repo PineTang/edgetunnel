@@ -66,10 +66,12 @@ export default {
 			}
 		} else if (管理员密码 && upgradeHeader === 'websocket') {// WebSocket代理
 			const 反代上下文 = await 反代参数获取(url, userID, 默认反代IP, 默认反代兜底);
+			反代上下文.DoHIPv4Only = !['0', 'false'].includes(String(env.DOH_IPV4_ONLY ?? 'true').trim().toLowerCase());
 			log(`[WebSocket] 命中请求: ${url.pathname}${url.search}`);
 			return await 处理WS请求(request, userID, url, 反代上下文);
 		} else if (管理员密码 && !访问路径.startsWith('admin/') && 访问路径 !== 'login' && request.method === 'POST') {// gRPC/叉HTTP代理
 			const 反代上下文 = await 反代参数获取(url, userID, 默认反代IP, 默认反代兜底);
+			反代上下文.DoHIPv4Only = !['0', 'false'].includes(String(env.DOH_IPV4_ONLY ?? 'true').trim().toLowerCase());
 			const { 头: 本机Padding头, 键: 本机Padding键 } = 获取叉HTTPPadding标识(userID);
 			const 命中叉HTTP特征 = !!request.headers.get(本机Padding头) || !!url.searchParams.get(本机Padding键);
 			if (!命中叉HTTP特征 && contentType.startsWith('application/grpc')) {
@@ -2172,6 +2174,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 	const ctx代理全局 = 反代上下文.代理全局 !== undefined ? 反代上下文.代理全局 : false;
 	const ctx代理参数 = 反代上下文.代理参数 || {};
 	const ctx反代兜底 = 反代上下文.反代兜底 !== undefined ? 反代上下文.反代兜底 : true;
+	const 强制IPv4直连 = 反代上下文.DoHIPv4Only !== false;
 	let 反代数组索引 = 0;
 	log(`[TCP转发] 目标: ${host}:${portNum} | 反代IP: ${ctx反代IP} | 反代兜底: ${ctx反代兜底 ? '是' : '否'} | 反代类型: ${ctx代理类型 || 'proxyip'} | 全局: ${ctx代理全局 ? '是' : '否'}`);
 	const 连接超时毫秒 = 1000;
@@ -2214,10 +2217,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 	};
 
 	async function 等待连接建立(remoteSock, timeoutMs = 连接超时毫秒) {
-		await Promise.race([
-			remoteSock.opened,
-			new Promise((_, reject) => setTimeout(() => reject(new Error('连接超时')), timeoutMs))
-		]);
+		await withTimeout(remoteSock.opened, timeoutMs, '连接超时');
 	}
 
 	async function 打开TCP连接(address, port) {
@@ -2293,6 +2293,33 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 	}
 
 	async function connectDirect(address, port, data = null, 启用预加载 = false) {
+		// 仅约束目标直连；代理服务器地址及特殊反代兜底保持原有语义。
+		if (强制IPv4直连 && 启用预加载) {
+			const IPv4列表 = await 解析直连IPv4(address);
+			const 并发数 = Math.max(1, TCP并发拨号数 | 0);
+			log(`[DoH IPv4] ${address}:${port} 候选: ${IPv4列表.join(', ')}，禁止域名/AAAA回退`);
+			let 最后错误;
+			for (let i = 0; i < IPv4列表.length; i += 并发数) {
+				const 候选列表 = IPv4列表.slice(i, i + 并发数).map(hostname => ({ hostname, port }));
+				let 连接结果;
+				try {
+					连接结果 = await 并发打开候选连接(候选列表);
+				} catch (error) {
+					最后错误 = error;
+					log(`[DoH IPv4] 本批拨号失败，继续尝试剩余 A 记录`);
+					continue;
+				}
+				try {
+					await 写入首包(连接结果.socket, data);
+					log(`[DoH IPv4] 直连成功: ${address} -> ${连接结果.candidate.hostname}:${port}`);
+					return 连接结果.socket;
+				} catch (error) {
+					try { 连接结果.socket.close() } catch (_) { }
+					throw error;
+				}
+			}
+			throw 最后错误 || new Error('所有 IPv4 候选连接失败');
+		}
 		const 预加载候选列表 = 启用预加载 ? await 构建预加载竞速候选列表(address, port) : null;
 		const 候选列表 = 预加载候选列表 || Array.from({ length: TCP并发拨号数 }, (_, attempt) => ({ hostname: address, port, attempt }));
 		log(预加载候选列表
@@ -2353,6 +2380,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 			await remoteConnWrapper.connectingPromise;
 			return;
 		}
+		if (强制IPv4直连) log('[DoH IPv4] 进入代理路径：最终出口及地址族由上游决定，不受直连 IPv4 策略控制');
 		const { generation: 当前连接世代, downlinkDrain } = 开始TCP连接世代(remoteConnWrapper);
 
 		let 本次发送首包 = false, 本次首包数据 = null;
@@ -2453,7 +2481,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 		} catch (err) {
 			log(`[TCP转发] 直连 ${host}:${portNum} 失败: ${err.message}`);
 			if (remoteConnWrapper.generation !== 直连世代) throw err;
-			if (err instanceof Error && err.name === '预加载解析为空') {
+			if (err instanceof Error && (err.name === '预加载解析为空' || err.name === 'DoHIPv4Error')) {
 				closeSocketQuietly(ws);
 				throw err;
 			}
@@ -5431,13 +5459,29 @@ function 替换星号为随机字符(内容) {
 	});
 }
 
+async function 解析直连IPv4(hostname) {
+	const host = stripIPv6Brackets(hostname);
+	if (isIPv4(host)) return [host];
+	const 失败 = message => {
+		const error = new Error(message);
+		error.name = 'DoHIPv4Error';
+		return error;
+	};
+	if (host.includes(':')) throw 失败('IPv4 直连模式不接受 IPv6 目标，请让客户端传入域名或 IPv4');
+	const records = await DoH查询(host, 'A');
+	const addresses = [...new Set(records.filter(record => record.type === 1 && typeof record.data === 'string' && isIPv4(record.data)).map(record => record.data))];
+	if (!addresses.length) throw 失败(`DoH 未取得 ${host} 的有效 A 记录，已阻止域名/IPv6及代理回退`);
+	return addresses;
+}
+
 const DoH缓存 = {};
 const DoH缓存最大条目 = 256;
+const DoH查询超时毫秒 = 3000;
 const DoH记录类型映射 = { A: 1, NS: 2, CNAME: 5, MX: 15, TXT: 16, AAAA: 28, SRV: 33, HTTPS: 65 };
 async function DoH查询(域名, 记录类型, DoH解析服务 = "https://cloudflare-dns.com/dns-query") {
 	const 规范化域名 = String(域名 || '').trim().toLowerCase().replace(/\.$/, '');
 	const 规范化记录类型 = String(记录类型 || '').trim().toUpperCase();
-	const 缓存键 = `${规范化域名}:${规范化记录类型}`;
+	const 缓存键 = `${DoH解析服务}:${规范化域名}:${规范化记录类型}`;
 	const qtype = DoH记录类型映射[规范化记录类型] || 1;
 	const 当前时间戳 = Date.now();
 	const 现缓存项 = DoH缓存[缓存键];
@@ -5446,15 +5490,18 @@ async function DoH查询(域名, 记录类型, DoH解析服务 = "https://cloudf
 		return 现缓存项.data.map(data => ({ type: qtype, data }));
 	}
 	const 开始时间 = performance.now();
+	const controller = new AbortController();
 	log(`[DoH查询] 开始查询 ${域名} ${记录类型} via ${DoH解析服务}`);
 	try {
 		// 记录类型字符串转数值
 		// 编码域名为 DNS wire format labels
 		const 编码域名 = (name) => {
 			const parts = name.endsWith('.') ? name.slice(0, -1).split('.') : name.split('.');
+			if (!name || name.length > 253) throw new Error('无效的 DNS 域名长度');
 			const bufs = [];
 			for (const label of parts) {
 				const enc = new TextEncoder().encode(label);
+				if (!enc.length || enc.length > 63) throw new Error('无效的 DNS label 长度');
 				bufs.push(new Uint8Array([enc.length]), enc);
 			}
 			bufs.push(new Uint8Array([0]));
@@ -5478,24 +5525,30 @@ async function DoH查询(域名, 记录类型, DoH解析服务 = "https://cloudf
 
 		// 通过 POST 发送 dns-message 请求
 		log(`[DoH查询] 发送查询报文 ${域名} via ${DoH解析服务} (type=${qtype}, ${query.length}字节)`);
-		const response = await fetch(DoH解析服务, {
-			method: 'POST',
-			headers: {
-				'Content-Type': 'application/dns-message',
-				'Accept': 'application/dns-message',
-			},
-			body: query,
-		});
-		if (!response.ok) {
-			console.warn(`[DoH查询] 请求失败 ${域名} ${记录类型} via ${DoH解析服务} 响应代码:${response.status}`);
-			return [];
-		}
+		const buf = await withTimeout((async () => {
+			const response = await fetch(DoH解析服务, {
+				method: 'POST',
+				headers: {
+					'Content-Type': 'application/dns-message',
+					'Accept': 'application/dns-message',
+				},
+				body: query,
+				signal: controller.signal,
+			});
+			if (!response.ok) throw new Error(`DoH HTTP ${response.status}`);
+			return new Uint8Array(await response.arrayBuffer());
+		})(), DoH查询超时毫秒, 'DoH 查询超时');
 
 		// 解析 DNS 响应报文
-		const buf = new Uint8Array(await response.arrayBuffer());
+		if (buf.length < 12) throw new Error('DNS 响应头不完整');
 		const dv = new DataView(buf.buffer);
+		const flags = dv.getUint16(2);
+		if (dv.getUint16(0) !== qview.getUint16(0) || !(flags & 0x8000) || (flags & 0x0200) || (flags & 0x000f)) {
+			throw new Error(`无效的 DNS 响应或 RCODE=${flags & 0x000f}`);
+		}
 		const qdcount = dv.getUint16(4);
 		const ancount = dv.getUint16(6);
+		if (qdcount !== 1) throw new Error('DNS Question 数量不匹配');
 		log(`[DoH查询] 收到响应 ${域名} ${记录类型} via ${DoH解析服务} (${buf.length}字节, ${ancount}条应答)`);
 
 		// 解析域名（处理指针压缩）
@@ -5506,14 +5559,17 @@ async function DoH查询(域名, 记录类型, DoH解析服务 = "https://cloudf
 				const len = buf[p];
 				if (len === 0) { if (!jumped) endPos = p + 1; break }
 				if ((len & 0xC0) === 0xC0) {
+					if (p + 1 >= buf.length) throw new Error('DNS 压缩指针不完整');
 					if (!jumped) endPos = p + 2;
 					p = ((len & 0x3F) << 8) | buf[p + 1];
 					jumped = true;
 					continue;
 				}
+				if (len > 63 || p + 1 + len > buf.length) throw new Error('DNS label 不完整');
 				labels.push(new TextDecoder().decode(buf.slice(p + 1, p + 1 + len)));
 				p += len + 1;
 			}
+			if (p >= buf.length || safe < 0) throw new Error('无效的 DNS 压缩名称');
 			if (endPos === -1) endPos = p + 1;
 			return [labels.join('.'), endPos];
 		};
@@ -5521,19 +5577,24 @@ async function DoH查询(域名, 记录类型, DoH解析服务 = "https://cloudf
 		// 跳过 Question Section
 		let offset = 12;
 		for (let i = 0; i < qdcount; i++) {
-			const [, end] = 解析域名(offset);
+			const [questionName, end] = 解析域名(offset);
+			if (questionName.toLowerCase() !== 规范化域名 || end + 4 > buf.length || dv.getUint16(end) !== qtype || dv.getUint16(end + 2) !== 1) {
+				throw new Error('DNS Question 不匹配');
+			}
 			offset = /** @type {number} */ (end) + 4; // +4 跳过 QTYPE + QCLASS
 		}
 
 		// 解析 Answer Section
 		const answers = [];
-		for (let i = 0; i < ancount && offset < buf.length; i++) {
+		for (let i = 0; i < ancount; i++) {
 			const [name, nameEnd] = 解析域名(offset);
 			offset = /** @type {number} */ (nameEnd);
+			if (offset + 10 > buf.length) throw new Error('DNS 记录头不完整');
 			const type = dv.getUint16(offset); offset += 2;
 			offset += 2; // CLASS
 			const ttl = dv.getUint32(offset); offset += 4;
 			const rdlen = dv.getUint16(offset); offset += 2;
+			if (offset + rdlen > buf.length) throw new Error('DNS 记录数据不完整');
 			const rdata = buf.slice(offset, offset + rdlen);
 			offset += rdlen;
 
@@ -5567,13 +5628,13 @@ async function DoH查询(域名, 记录类型, DoH解析服务 = "https://cloudf
 		}
 		const 耗时 = (performance.now() - 开始时间).toFixed(2);
 		log(`[DoH查询] 查询完成 ${域名} ${记录类型} via ${DoH解析服务} ${耗时}ms 共${answers.length}条结果${answers.length > 0 ? '\n' + answers.map((a, i) => `  ${i + 1}. ${a.name} type=${a.type} TTL=${a.TTL} data=${a.data}`).join('\n') : ''}`);
-		// DoH 缓存至少保留 5 分钟，响应 TTL 更长时尊重响应 TTL；空响应使用 5 分钟负缓存
+		// 不延长权威 TTL；CNAME 链较短的 TTL 同样约束缓存。失败/空结果不缓存。
 		const 相关记录 = answers.filter(answer => answer.type === qtype);
-		const 最小TTL = 相关记录.length > 0 ? Math.min(...相关记录.map(a => a.TTL)) : 0;
-		const 缓存TTL = Math.max(最小TTL, 5 * 60);
+		const TTL记录 = answers.filter(answer => answer.type === qtype || answer.type === 5);
+		const 缓存TTL = 相关记录.length > 0 ? Math.min(300, ...TTL记录.map(a => a.TTL)) : 0;
 		const 缓存过期时间 = Date.now() + 缓存TTL * 1000;
 		const 缓存数据 = 相关记录.map(answer => answer.data);
-		if (缓存数据.length > 0 || answers.length === 0) {
+		if (缓存数据.length > 0 && 缓存TTL > 0) {
 			if (Object.keys(DoH缓存).length >= DoH缓存最大条目) {
 				const 清理时间戳 = Date.now();
 				for (const [缓存条目键, 缓存条目] of Object.entries(DoH缓存)) {
@@ -5591,6 +5652,8 @@ async function DoH查询(域名, 记录类型, DoH解析服务 = "https://cloudf
 		const 耗时 = (performance.now() - 开始时间).toFixed(2);
 		console.error(`[DoH查询] 查询失败 ${域名} ${记录类型} via ${DoH解析服务} ${耗时}ms:`, error);
 		return [];
+	} finally {
+		controller.abort();
 	}
 }
 
