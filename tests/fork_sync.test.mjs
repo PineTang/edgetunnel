@@ -52,7 +52,7 @@ test('version API returns the numeric upstream version', async () => {
   const context = runtime();
   const response = await context.worker.fetch(request(`/version?uuid=${uuid}`, {}, 'GET'), { ADMIN: 'test', UUID: uuid }, {});
   assert.equal(response.status, 200);
-  assert.deepEqual(await response.json(), { Version: 20261008222327 });
+  assert.deepEqual(await response.json(), { Version: 20261110232646 });
 });
 
 test('generated XHTTP padding matches the inbound header and query identifiers', () => {
@@ -87,6 +87,35 @@ test('subscription requests carry the upstream UID/version and preserve optional
   for (const { url, options } of calls) {
     const expectedUID = url.includes('default.example') ? '000000' : uid;
     assert.equal(options.headers['User-Agent'],
-      `v2rayN/edgetunnel (https://github.com/cmliu/edgetunnel) Uid/0x${expectedUID} Version/20261008222327`);
+      `v2rayN/edgetunnel (https://github.com/cmliu/edgetunnel) Uid/0x${expectedUID} Version/20261110232646`);
+  }
+});
+
+test('XHTTP mux is opt-in and preserves custom connection parameters', () => {
+  const context = runtime();
+  const xmux = { maxConnections: 8, maxConcurrency: 0, hMaxReusableSecs: 1800 };
+  for (const reuse of [undefined, { 启用: false, xmux }, { 启用: true, xmux }]) {
+    const config = context.获取传输协议配置({ UUID: uuid, 传输协议: 'xhttp', 连接复用: reuse });
+    const extra = JSON.parse(new URLSearchParams(config.type).get('extra'));
+    assert.deepEqual(extra.xmux, reuse?.启用 ? xmux : undefined);
+    // Legacy WS/gRPC configs can omit the new section too.
+    assert.equal(context.获取传输协议配置({ UUID: uuid, 传输协议: 'ws' }).type, 'ws');
+    assert.equal(context.获取传输协议配置({ UUID: uuid, 传输协议: 'grpc' }).type, 'grpc&mode=gun');
+  }
+});
+
+test('stored configs gain mux defaults without losing custom values or enabling old configs', async () => {
+  const context = runtime();
+  const storage = new Map();
+  const env = { KV: { get: async key => storage.get(key) ?? null, put: async (key, value) => storage.set(key, value) } };
+  const fresh = await context.读取config_JSON(env, 'node.example', uuid);
+  assert.equal(fresh.连接复用.启用, false);
+  assert.equal(fresh.连接复用.xmux.maxConnections, 4);
+  const defaults = JSON.parse(JSON.stringify(fresh.连接复用.xmux));
+  for (const reuse of [undefined, { 启用: true }, { 启用: true, xmux: { maxConnections: 8, hMaxReusableSecs: 0 } }]) {
+    storage.set('config.json', JSON.stringify({ ...fresh, 连接复用: reuse }));
+    const migrated = await context.读取config_JSON(env, 'node.example', uuid);
+    assert.equal(migrated.连接复用.启用, reuse?.启用 ?? false);
+    assert.deepEqual(JSON.parse(JSON.stringify(migrated.连接复用.xmux)), { ...defaults, ...reuse?.xmux });
   }
 });
