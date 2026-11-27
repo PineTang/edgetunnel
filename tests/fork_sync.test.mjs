@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 import test from 'node:test';
+import { webcrypto } from 'node:crypto';
 
 const source = readFileSync(new URL('../_worker.js', import.meta.url), 'utf8');
 const uuid = '90cd4a77-141a-43c9-991b-08263cfe9c10';
@@ -10,7 +11,7 @@ function runtime(fetch = async () => { throw new Error('Unexpected network reque
   const context = vm.createContext({
     URL, URLSearchParams, TextEncoder, TextDecoder, AbortController,
     Request, Response, Headers, performance, setTimeout, clearTimeout,
-    atob, btoa, fetch, console,
+    atob, btoa, fetch, console, crypto: webcrypto,
   });
   vm.runInContext(source.replace('export default {', 'globalThis.worker = {'), context);
   // Authentication hashing and protocol handlers are outside these routing checks.
@@ -52,7 +53,7 @@ test('version API returns the numeric upstream version', async () => {
   const context = runtime();
   const response = await context.worker.fetch(request(`/version?uuid=${uuid}`, {}, 'GET'), { ADMIN: 'test', UUID: uuid }, {});
   assert.equal(response.status, 200);
-  assert.deepEqual(await response.json(), { Version: 20261110232646 });
+  assert.deepEqual(await response.json(), { Version: 20261124194656 });
 });
 
 test('generated XHTTP padding matches the inbound header and query identifiers', () => {
@@ -87,7 +88,7 @@ test('subscription requests carry the upstream UID/version and preserve optional
   for (const { url, options } of calls) {
     const expectedUID = url.includes('default.example') ? '000000' : uid;
     assert.equal(options.headers['User-Agent'],
-      `v2rayN/edgetunnel (https://github.com/cmliu/edgetunnel) Uid/0x${expectedUID} Version/20261110232646`);
+      `v2rayN/edgetunnel (https://github.com/cmliu/edgetunnel) Uid/0x${expectedUID} Version/20261124194656`);
   }
 });
 
@@ -117,5 +118,66 @@ test('stored configs gain mux defaults without losing custom values or enabling 
     const migrated = await context.读取config_JSON(env, 'node.example', uuid);
     assert.equal(migrated.连接复用.启用, reuse?.启用 ?? false);
     assert.deepEqual(JSON.parse(JSON.stringify(migrated.连接复用.xmux)), { ...defaults, ...reuse?.xmux });
+  }
+});
+
+test('Telegram session endpoints enforce authentication without entering XHTTP or gRPC', async () => {
+  const context = runtime();
+  const env = { ADMIN: 'test', UUID: uuid };
+  for (const [path, headers, method] of [
+    ['/api/v1/session', { 'Content-Type': 'application/grpc' }, 'POST'],
+    ['/api/v1/session', {}, 'DELETE'],
+    ['/api/v1/ws', { Upgrade: 'websocket' }, 'GET'],
+  ]) {
+    const response = await context.worker.fetch(request(path, headers, method), env, {});
+    assert.equal(response.status, 404);
+    assert.equal(await response.text(), '');
+  }
+});
+
+test('Telegram session creation validates the opening frame and issues a revocable token', async () => {
+  const context = runtime();
+  const env = { ADMIN: 'test', UUID: uuid };
+  // runtime() deliberately stubs MD5MD5; the bootstrap secret is therefore fixed here.
+  const headers = { Authorization: `Bearer ${'0'.repeat(32)}`, 'Content-Type': 'application/octet-stream' };
+  const post = body => {
+    const req = new Request('https://node.example/api/v1/session', { method: 'POST', headers, body });
+    req.cf = { colo: 'SJC' };
+    return context.worker.fetch(req, env, {});
+  };
+  assert.equal((await post(new Uint8Array([16]))).status, 404);
+  const response = await post(new Uint8Array([16, 0, 0, 0, 0, 0, 0, 1, 1]));
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get('X-Carrier-Mode'), 'websocket-lanes');
+  assert.equal(response.headers.get('Cache-Control'), 'no-store');
+  assert.deepEqual([...new Uint8Array(await response.arrayBuffer())], [17, 0, 0, 0, 0, 0, 0, 0]);
+  const token = response.headers.get('X-Session-Token');
+  assert.match(token, /^[A-Za-z0-9_-]{43}$/);
+  const auth = { Authorization: `Bearer ${token}` };
+  assert.equal((await context.worker.fetch(request('/api/v1/session', auth, 'DELETE'), env, {})).status, 204);
+  const denied = await context.worker.fetch(request('/api/v1/ws', {
+    Upgrade: 'websocket',
+    'Sec-WebSocket-Protocol': `tproxy-lane-v1.${token}.1`,
+  }, 'GET'), env, {});
+  assert.equal(denied.status, 409);
+});
+
+test('Telegram bridge validates the capability and serves the upstream bridge with security headers', async () => {
+  const context = runtime();
+  const env = { ADMIN: 'test', UUID: uuid };
+  const secret = `dd${uuid.replaceAll('-', '')}`;
+  const key = await webcrypto.subtle.importKey('raw', Buffer.from(secret, 'hex'), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const signature = await webcrypto.subtle.sign('HMAC', key, new TextEncoder().encode('tdesktop-web-proxy-bridge-v1\nnode.example'));
+  const cap = Buffer.from(signature).toString('base64url');
+  const valid = await context.worker.fetch(request(`/?bridge=${cap}`, {}, 'GET'), env, {});
+  assert.equal(valid.status, 200);
+  assert.equal(valid.headers.get('Cache-Control'), 'no-store');
+  assert.equal(valid.headers.get('Referrer-Policy'), 'no-referrer');
+  assert.match(valid.headers.get('Content-Security-Policy'), /frame-ancestors http:\/\/127\.0\.0\.1:\*/);
+  assert.match(await valid.text(), /tproxy-init/);
+  for (const [capability, method] of [['invalid', 'GET'], [cap, 'HEAD']]) {
+    const response = await context.worker.fetch(request(`/?bridge=${capability}`, {}, method), env, {});
+    assert.equal(response.status, 200);
+    assert.doesNotMatch(await response.text(), /tproxy-init/);
   }
 });
